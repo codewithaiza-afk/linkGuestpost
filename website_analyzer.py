@@ -3,7 +3,11 @@ import time
 import requests
 from urllib.parse import urljoin, urlparse
 from typing import Dict, Any, List, Optional, Tuple
-from playwright.sync_api import Page, sync_playwright
+try:
+    from playwright.sync_api import Page, sync_playwright
+except Exception:
+    Page = Any
+    sync_playwright = None
 
 COMMON_GUIDELINE_PATHS = [
     "/write-for-us",

@@ -5,7 +5,21 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
-DB_PATH = Path(__file__).resolve().parent / "linkforge.db"
+def _resolve_db_path() -> Path:
+    # On serverless platforms like Vercel or AWS Lambda, the app root is read-only.
+    # Fall back to /tmp where SQLite has write permissions.
+    if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+        return Path("/tmp") / "linkforge.db"
+    default_dir = Path(__file__).resolve().parent
+    try:
+        test_file = default_dir / ".db_write_test"
+        test_file.touch()
+        test_file.unlink()
+        return default_dir / "linkforge.db"
+    except (OSError, PermissionError):
+        return Path("/tmp") / "linkforge.db"
+
+DB_PATH = _resolve_db_path()
 
 def get_connection():
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)

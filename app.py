@@ -138,7 +138,10 @@ class RunBatchRequest(BaseModel):
 def serve_dashboard():
     index_path = STATIC_DIR / "index.html"
     if index_path.exists():
-        return FileResponse(str(index_path))
+        try:
+            return HTMLResponse(content=index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return FileResponse(str(index_path))
     return HTMLResponse("<h1>LinkForge Dashboard Initializing...</h1>")
 
 

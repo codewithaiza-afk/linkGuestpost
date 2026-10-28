@@ -11,12 +11,20 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Callable
 
 import requests
-from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
+try:
+    from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
+    _has_playwright = True
+except Exception:
+    sync_playwright = None
+    Page = Any
+    BrowserContext = Any
+    PlaywrightTimeout = Exception
+    _has_playwright = False
 
 try:
     from playwright_stealth import stealth_sync
     _has_stealth = True
-except ImportError:
+except (ImportError, Exception):
     _has_stealth = False
 
 import database as db
