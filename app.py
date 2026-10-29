@@ -207,7 +207,17 @@ def get_active_profile():
 @app.post("/api/profiles")
 def create_profile(payload: BusinessProfilePayload):
     """Create a new business profile with separate backlink payload & Gmail App Password."""
-    return db.create_business_profile(payload.dict())
+    try:
+        result = db.create_business_profile(payload.dict())
+        if not result:
+            raise HTTPException(status_code=500, detail="Profile created but could not be retrieved.")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] create_profile failed: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/profiles/{profile_id}")

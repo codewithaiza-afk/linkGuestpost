@@ -1354,7 +1354,11 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        if (!res.ok) throw new Error('Failed to create business profile');
+        if (!res.ok) {
+          let errMsg = 'Failed to create business profile';
+          try { const d = await res.json(); errMsg = d.detail || d.message || errMsg; } catch(e) {}
+          throw new Error(`Server error ${res.status}: ${errMsg}`);
+        }
         closeNewProfileModal();
         await loadBusinessProfiles();
         await loadTargets();
