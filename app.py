@@ -17,6 +17,12 @@ from automation import automation_engine
 from content_generator import smart_content_generator
 from email_client import email_outreach_client
 
+# Always initialise DB on startup (critical for Vercel where /tmp is ephemeral)
+try:
+    db.init_db()
+except Exception as _db_init_err:
+    print(f"[WARN] DB init on startup failed: {_db_init_err}")
+
 app = FastAPI(
     title="LinkForge Autonomous SEO & Backlink Command Center",
     version="2.5.0",

@@ -363,6 +363,12 @@ def get_active_business_profile(mask_passwords: bool = False) -> Dict[str, Any]:
 
 
 def create_business_profile(data: Dict[str, Any]) -> Dict[str, Any]:
+    # Re-initialise DB tables in case we're in a fresh Vercel /tmp environment
+    try:
+        init_db()
+    except Exception:
+        pass
+
     name = (data.get("name") or "New Business").strip()
     niche = (data.get("niche") or "General").strip()
     backlink_url = (data.get("backlink_url") or "").strip()
