@@ -171,7 +171,8 @@ def get_config():
     has_openai = bool(res.get("openai_api_key") or os.getenv("OPENAI_API_KEY"))
     res["smtp_pass"] = "••••••••" if has_smtp else ""
     res["imap_pass"] = "••••••••" if has_imap else ""
-    res["openai_api_key"] = "••••••••" if has_openai else ""
+    # Do NOT expose the OpenAI API key in the dashboard response
+    # res["openai_api_key"] = "••••••••" if has_openai else ""
     res["has_openai_key"] = has_openai
     res["is_email_configured"] = bool(res.get("default_email") and has_smtp)
     return res
