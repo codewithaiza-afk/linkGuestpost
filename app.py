@@ -132,9 +132,26 @@ class RunBatchRequest(BaseModel):
     ids: Optional[List[int]] = None
 
 
+@app.middleware("http")
+async def vercel_path_rewrite_middleware(request, call_next):
+    # Normalize paths when Vercel serverless rewrites requests to /api/index or /api/index.py
+    path = request.scope.get("path", "")
+    for prefix in ("/api/index.py", "/api/index"):
+        if path == prefix:
+            request.scope["path"] = "/"
+            break
+        elif path.startswith(prefix + "/"):
+            request.scope["path"] = path[len(prefix):]
+            break
+    response = await call_next(request)
+    return response
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/api/index", response_class=HTMLResponse)
+@app.get("/api/index.py", response_class=HTMLResponse)
 def serve_dashboard():
     index_path = STATIC_DIR / "index.html"
     if index_path.exists():
