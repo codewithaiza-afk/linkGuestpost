@@ -3,6 +3,7 @@
     { "source": "/(.*)", "destination": "/api/index.py" }
   ],
   "env": {
-    "PYTHONPATH": "."
+    "PYTHONPATH": ".",
+    "VERCEL": "1"
   }
 }

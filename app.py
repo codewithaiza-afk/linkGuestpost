@@ -40,7 +40,7 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-# Mount static assets
+# Mount static assets (only when directory exists)
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -138,33 +138,35 @@ class RunBatchRequest(BaseModel):
     ids: Optional[List[int]] = None
 
 
+# ─── Vercel Path Rewrite Middleware ───────────────────────────────────────────
+# When vercel.json has { "source": "/(.*)", "destination": "/api/index.py" }
+# Vercel forwards ALL requests to /api/index.py.
+# The ORIGINAL path is preserved in the ASGI scope["path"] by Vercel's
+# Python runtime, BUT some runtime versions prepend /api/index.py to the path.
+# We try multiple detection strategies so ALL Vercel runtime variants work.
+
 @app.middleware("http")
 async def vercel_path_rewrite_middleware(request, call_next):
-    """
-    Vercel rewrites ALL requests to /api/index.py with the original path
-    stored in the query string as '__path'. We extract that and restore the
-    real path so that FastAPI sees the correct route.
+    import urllib.parse as _up
 
-    Vercel passes the original URL path via the 'x-vercel-id' header is not
-    useful, but the raw ASGI scope 'path' already contains what Vercel forwarded.
-
-    When vercel.json has  { "source": "/(.*)", "destination": "/api/index.py" }
-    Vercel sets scope['path'] = '/api/index.py' and puts the real path in
-    scope['raw_path'] as well as the query string param '_path' (undocumented).
-    The safest approach: read the original path from the 'x-original-url'
-    header (set by Vercel) or fall back to stripping the /api/index.py prefix.
-    """
     path = request.scope.get("path", "")
+    qs   = request.scope.get("query_string", b"").decode("utf-8", errors="ignore")
 
-    # Method 1: Vercel sets x-original-url header with the real path
-    original_url = request.headers.get("x-original-url") or request.headers.get("x-forwarded-url")
-    if original_url:
-        from urllib.parse import urlparse
-        parsed = urlparse(original_url)
-        real_path = parsed.path or "/"
+    # Strategy 1: Vercel edge-runtime passes real path in ?__path= query param
+    if "__path=" in qs:
+        params = dict(_up.parse_qsl(qs))
+        real = params.get("__path", "")
+        if real:
+            request.scope["path"] = real
+            clean_qs = "&".join(f"{k}={v}" for k, v in params.items() if k != "__path")
+            request.scope["query_string"] = clean_qs.encode()
+    # Strategy 2: real path in x-original-url / x-forwarded-url header
+    elif request.headers.get("x-original-url") or request.headers.get("x-forwarded-url"):
+        raw = request.headers.get("x-original-url") or request.headers.get("x-forwarded-url")
+        real_path = _up.urlparse(raw).path or "/"
         request.scope["path"] = real_path
-    else:
-        # Method 2: Strip the /api/index.py or /api/index prefix that Vercel prepends
+    # Strategy 3: Vercel prepends /api/index.py to every path — strip it
+    elif path.startswith("/api/index.py") or path.startswith("/api/index"):
         for prefix in ("/api/index.py", "/api/index"):
             if path == prefix:
                 request.scope["path"] = "/"
@@ -172,6 +174,7 @@ async def vercel_path_rewrite_middleware(request, call_next):
             elif path.startswith(prefix + "/"):
                 request.scope["path"] = path[len(prefix):]
                 break
+    # Strategy 4: path is just "/" already — leave it (happens on cold start)
 
     response = await call_next(request)
     return response
@@ -194,6 +197,7 @@ def serve_dashboard():
 
 @app.get("/api/config")
 def get_config():
+    db.init_db()  # ensure tables exist on every Vercel cold start
     cfg = db.get_business_config()
     res = dict(cfg)
     has_smtp = bool(res.get("smtp_pass"))
@@ -201,8 +205,8 @@ def get_config():
     has_openai = bool(res.get("openai_api_key") or os.getenv("OPENAI_API_KEY"))
     res["smtp_pass"] = "••••••••" if has_smtp else ""
     res["imap_pass"] = "••••••••" if has_imap else ""
-    # Do NOT expose the OpenAI API key in the dashboard response
-    # res["openai_api_key"] = "••••••••" if has_openai else ""
+    # Do NOT send the raw OpenAI key to the browser
+    res.pop("openai_api_key", None)
     res["has_openai_key"] = has_openai
     res["is_email_configured"] = bool(res.get("default_email") and has_smtp)
     return res
@@ -219,19 +223,22 @@ def update_config(payload: ConfigUpdate):
 @app.get("/api/profiles")
 def get_profiles():
     """List all business profiles with masked credentials."""
+    db.init_db()
     return db.get_business_profiles(mask_passwords=True)
 
 
 @app.get("/api/profiles/active")
 def get_active_profile():
     """Get the currently active business profile."""
+    db.init_db()
     return db.get_active_business_profile(mask_passwords=True)
 
 
 @app.post("/api/profiles")
 def create_profile(payload: BusinessProfilePayload):
-    """Create a new business profile with separate backlink payload & Gmail App Password."""
+    """Create a new business profile."""
     try:
+        db.init_db()  # guard against fresh /tmp on Vercel
         result = db.create_business_profile(payload.dict())
         if not result:
             raise HTTPException(status_code=500, detail="Profile created but could not be retrieved.")
@@ -278,28 +285,31 @@ def delete_profile(profile_id: int):
 
 @app.get("/api/targets")
 def list_targets(
-    status: Optional[str] = None, 
+    status: Optional[str] = None,
     search: Optional[str] = None,
     workflow: Optional[str] = None,
     approval_status: Optional[str] = None,
     stage: Optional[str] = None
 ):
+    db.init_db()
     return db.get_targets(
-        status=status, 
-        search=search, 
-        workflow=workflow, 
-        approval_status=approval_status, 
+        status=status,
+        search=search,
+        workflow=workflow,
+        approval_status=approval_status,
         stage=stage
     )
 
 
 @app.get("/api/approvals")
 def get_approvals():
+    db.init_db()
     return db.get_approval_queue()
 
 
 @app.post("/api/targets")
 def create_single_target(payload: TargetCreate):
+    db.init_db()
     created = db.add_target(payload.dict())
     if not created:
         raise HTTPException(status_code=400, detail="Target website already exists or URL is invalid.")
@@ -308,6 +318,7 @@ def create_single_target(payload: TargetCreate):
 
 @app.post("/api/targets/bulk-text")
 def bulk_text_import(payload: BulkTextCreate):
+    db.init_db()
     lines = payload.text.replace(",", "\n").split("\n")
     targets_data = [{"website_url": u.strip()} for u in lines if u.strip()]
     res = db.add_targets_bulk(targets_data)
@@ -318,6 +329,7 @@ def bulk_text_import(payload: BulkTextCreate):
 
 @app.post("/api/targets/upload")
 async def upload_excel_or_csv(file: UploadFile = File(...)):
+    db.init_db()
     filename = file.filename or "upload"
     contents = await file.read()
 
@@ -413,11 +425,14 @@ def approve_target_route(target_id: int, payload: ApprovalAction, background_tas
     item = db.approve_target(target_id, payload.notes or "")
     if not item:
         raise HTTPException(status_code=404, detail="Target not found.")
-    
+
     if payload.execute_now:
+        # NOTE: on Vercel serverless, BackgroundTasks run synchronously within
+        # the same invocation and the process exits after response is sent.
+        # Automation requiring Playwright will not work on Vercel's free tier.
         background_tasks.add_task(automation_engine.execute_approved_target, target_id)
         return {"status": "approved_and_executing", "target": db.get_target_by_id(target_id)}
-    
+
     return {"status": "approved", "target": item}
 
 
@@ -444,10 +459,10 @@ def regenerate_content(target_id: int):
         raise HTTPException(status_code=404, detail="Target not found.")
     cfg = db.get_business_config()
     report = item.get("analysis_report_parsed") or {}
-    
+
     art = smart_content_generator.generate_article(item, cfg, report)
     pitch = smart_content_generator.generate_pitch(item, cfg, report)
-    
+
     updated = db.update_target(target_id, {
         "generated_article_title": art["title"],
         "generated_article_body": art["body"],
@@ -481,6 +496,7 @@ def clear_all():
 
 @app.get("/api/stats")
 def get_stats():
+    db.init_db()
     return db.get_stats()
 
 
@@ -520,14 +536,9 @@ def verify_target(target_id: int):
 
     cfg = db.get_business_config()
     backlink = t.get("target_backlink_url") or cfg.get("backlink_url", "")
-    anchor = t.get("target_anchor_text") or cfg.get("anchor_text", "")
-    
-    ok = automation_engine.verify_live_url(
-        target_id,
-        t["live_post_url"],
-        backlink,
-        anchor
-    )
+    anchor   = t.get("target_anchor_text")  or cfg.get("anchor_text", "")
+
+    ok = automation_engine.verify_live_url(target_id, t["live_post_url"], backlink, anchor)
     return {"ok": ok, "target": db.get_target_by_id(target_id)}
 
 
@@ -544,15 +555,14 @@ def get_automation_status():
 
 @app.post("/api/email/test")
 def test_email_connection(payload: Optional[EmailTestRequest] = None):
-    recipient = payload.recipient.strip() if payload and payload.recipient else None
+    recipient  = payload.recipient.strip() if payload and payload.recipient else None
     profile_id = payload.profile_id if payload else None
     return email_outreach_client.test_connection(recipient, profile_id=profile_id)
 
 
 @app.post("/api/email/check-replies")
 def poll_email_replies(profile_id: Optional[int] = None):
-    res = email_outreach_client.check_inbox_replies(profile_id=profile_id)
-    return res
+    return email_outreach_client.check_inbox_replies(profile_id=profile_id)
 
 
 @app.post("/api/email/send-pitch/{target_id}")
@@ -560,21 +570,26 @@ def dispatch_single_pitch(target_id: int):
     t = db.get_target_by_id(target_id)
     if not t:
         raise HTTPException(status_code=404, detail="Target not found.")
-    
-    report = t.get("analysis_report_parsed") or {}
+
+    report    = t.get("analysis_report_parsed") or {}
     recipient = report.get("contact_email") or "editorial@target-domain.com"
-    subject = t.get("generated_pitch_subject") or "Guest Article Pitch"
-    body = t.get("generated_pitch_body") or ""
-    
-    res = email_outreach_client.send_pitch(recipient, subject, body, target_id)
-    return res
+    subject   = t.get("generated_pitch_subject") or "Guest Article Pitch"
+    body      = t.get("generated_pitch_body") or ""
+
+    return email_outreach_client.send_pitch(recipient, subject, body, target_id)
 
 
 # ─── Live SSE Logs Stream ─────────────────────────────────────────────────────
+# Vercel serverless functions have a hard 30-second timeout.
+# We close the SSE stream at 20 s so the browser's EventSource can reconnect
+# cleanly without hitting the hard kill. On local development the stream is
+# kept open indefinitely (up to 1 h).
 
 @app.get("/api/logs/stream")
 async def stream_logs():
-    """Server-Sent Events endpoint streaming real-time live execution logs."""
+    IS_VERCEL       = bool(os.environ.get("VERCEL"))
+    MAX_SSE_SECONDS = 20 if IS_VERCEL else 3600
+
     async def event_generator():
         queue: asyncio.Queue = asyncio.Queue()
 
@@ -585,11 +600,19 @@ async def stream_logs():
                 pass
 
         automation_engine.add_listener(listener)
+        start = asyncio.get_event_loop().time()
         try:
             yield f"data: {json.dumps({'message': 'Connected to LinkForge real-time execution stream', 'level': 'info', 'timestamp': ''})}\n\n"
             while True:
-                entry = await queue.get()
-                yield f"data: {json.dumps(entry)}\n\n"
+                elapsed = asyncio.get_event_loop().time() - start
+                if elapsed >= MAX_SSE_SECONDS:
+                    yield ": timeout\n\n"
+                    break
+                try:
+                    entry = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    yield f"data: {json.dumps(entry)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"   # keepalive so Vercel doesn't kill early
         except asyncio.CancelledError:
             pass
         finally:
