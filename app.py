@@ -5,7 +5,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,13 +37,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR   = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
 # Mount static assets (only when directory exists)
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+
+# ─── Pydantic Models ──────────────────────────────────────────────────────────
 
 class ConfigUpdate(BaseModel):
     niche: Optional[str] = None
@@ -138,54 +140,9 @@ class RunBatchRequest(BaseModel):
     ids: Optional[List[int]] = None
 
 
-# ─── Vercel Path Rewrite Middleware ───────────────────────────────────────────
-# When vercel.json has { "source": "/(.*)", "destination": "/api/index.py" }
-# Vercel forwards ALL requests to /api/index.py.
-# The ORIGINAL path is preserved in the ASGI scope["path"] by Vercel's
-# Python runtime, BUT some runtime versions prepend /api/index.py to the path.
-# We try multiple detection strategies so ALL Vercel runtime variants work.
+# ─── Helper: read dashboard HTML ──────────────────────────────────────────────
 
-@app.middleware("http")
-async def vercel_path_rewrite_middleware(request, call_next):
-    import urllib.parse as _up
-
-    path = request.scope.get("path", "")
-    qs   = request.scope.get("query_string", b"").decode("utf-8", errors="ignore")
-
-    # Strategy 1: Vercel edge-runtime passes real path in ?__path= query param
-    if "__path=" in qs:
-        params = dict(_up.parse_qsl(qs))
-        real = params.get("__path", "")
-        if real:
-            request.scope["path"] = real
-            clean_qs = "&".join(f"{k}={v}" for k, v in params.items() if k != "__path")
-            request.scope["query_string"] = clean_qs.encode()
-    # Strategy 2: real path in x-original-url / x-forwarded-url header
-    elif request.headers.get("x-original-url") or request.headers.get("x-forwarded-url"):
-        raw = request.headers.get("x-original-url") or request.headers.get("x-forwarded-url")
-        real_path = _up.urlparse(raw).path or "/"
-        request.scope["path"] = real_path
-    # Strategy 3: Vercel prepends /api/index.py to every path — strip it
-    elif path.startswith("/api/index.py") or path.startswith("/api/index"):
-        for prefix in ("/api/index.py", "/api/index"):
-            if path == prefix:
-                request.scope["path"] = "/"
-                break
-            elif path.startswith(prefix + "/"):
-                request.scope["path"] = path[len(prefix):]
-                break
-    # Strategy 4: path is just "/" already — leave it (happens on cold start)
-
-    response = await call_next(request)
-    return response
-
-
-# ─── Routes ──────────────────────────────────────────────────────────────────
-
-@app.get("/", response_class=HTMLResponse)
-@app.get("/api/index", response_class=HTMLResponse)
-@app.get("/api/index.py", response_class=HTMLResponse)
-def serve_dashboard():
+def _dashboard_response() -> HTMLResponse:
     index_path = STATIC_DIR / "index.html"
     if index_path.exists():
         try:
@@ -195,19 +152,47 @@ def serve_dashboard():
     return HTMLResponse("<h1>LinkForge Dashboard Initializing...</h1>")
 
 
+# ─── Debug endpoint (helps diagnose Vercel path issues) ───────────────────────
+
+@app.get("/api/debug")
+@app.post("/api/debug")
+async def debug_request(request: Request):
+    """Returns raw request scope info so we can see what Vercel actually sends."""
+    return {
+        "method": request.method,
+        "path": request.scope.get("path"),
+        "query_string": request.scope.get("query_string", b"").decode(),
+        "headers": dict(request.headers),
+    }
+
+
+# ─── Dashboard ────────────────────────────────────────────────────────────────
+# Vercel rewrites ALL requests to /api/index.py.
+# The Python runtime preserves the original path in scope['path'],
+# BUT some Vercel versions forward the REWRITTEN path (/api/index.py) instead.
+# We register both so either case works without any path-mangling middleware.
+
+@app.get("/")
+@app.get("/api/index")
+@app.get("/api/index.py")
+def serve_dashboard():
+    return _dashboard_response()
+
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
 @app.get("/api/config")
 def get_config():
-    db.init_db()  # ensure tables exist on every Vercel cold start
+    db.init_db()
     cfg = db.get_business_config()
     res = dict(cfg)
-    has_smtp = bool(res.get("smtp_pass"))
-    has_imap = bool(res.get("imap_pass"))
+    has_smtp   = bool(res.get("smtp_pass"))
+    has_imap   = bool(res.get("imap_pass"))
     has_openai = bool(res.get("openai_api_key") or os.getenv("OPENAI_API_KEY"))
-    res["smtp_pass"] = "••••••••" if has_smtp else ""
-    res["imap_pass"] = "••••••••" if has_imap else ""
-    # Do NOT send the raw OpenAI key to the browser
-    res.pop("openai_api_key", None)
-    res["has_openai_key"] = has_openai
+    res["smtp_pass"]  = "••••••••" if has_smtp  else ""
+    res["imap_pass"]  = "••••••••" if has_imap  else ""
+    res.pop("openai_api_key", None)          # never expose key to browser
+    res["has_openai_key"]      = has_openai
     res["is_email_configured"] = bool(res.get("default_email") and has_smtp)
     return res
 
@@ -218,37 +203,34 @@ def update_config(payload: ConfigUpdate):
     return db.update_business_config(updates)
 
 
-# ─── Multi-Business Profile Endpoints ────────────────────────────────────────
+# ─── Business Profiles ────────────────────────────────────────────────────────
 
 @app.get("/api/profiles")
 def get_profiles():
-    """List all business profiles with masked credentials."""
     db.init_db()
     return db.get_business_profiles(mask_passwords=True)
 
 
 @app.get("/api/profiles/active")
 def get_active_profile():
-    """Get the currently active business profile."""
     db.init_db()
     return db.get_active_business_profile(mask_passwords=True)
 
 
 @app.post("/api/profiles")
 def create_profile(payload: BusinessProfilePayload):
-    """Create a new business profile."""
     try:
-        db.init_db()  # guard against fresh /tmp on Vercel
+        db.init_db()
         result = db.create_business_profile(payload.dict())
         if not result:
             raise HTTPException(status_code=500, detail="Profile created but could not be retrieved.")
         return result
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception as exc:
         import traceback
-        print(f"[ERROR] create_profile failed: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[ERROR] create_profile: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/profiles/{profile_id}")
@@ -283,21 +265,20 @@ def delete_profile(profile_id: int):
     return {"success": True, "message": f"Profile {profile_id} deleted successfully."}
 
 
+# ─── Targets ──────────────────────────────────────────────────────────────────
+
 @app.get("/api/targets")
 def list_targets(
     status: Optional[str] = None,
     search: Optional[str] = None,
     workflow: Optional[str] = None,
     approval_status: Optional[str] = None,
-    stage: Optional[str] = None
+    stage: Optional[str] = None,
 ):
     db.init_db()
     return db.get_targets(
-        status=status,
-        search=search,
-        workflow=workflow,
-        approval_status=approval_status,
-        stage=stage
+        status=status, search=search, workflow=workflow,
+        approval_status=approval_status, stage=stage,
     )
 
 
@@ -307,24 +288,15 @@ def get_approvals():
     return db.get_approval_queue()
 
 
-@app.post("/api/targets")
-def create_single_target(payload: TargetCreate):
-    db.init_db()
-    created = db.add_target(payload.dict())
-    if not created:
-        raise HTTPException(status_code=400, detail="Target website already exists or URL is invalid.")
-    return created
-
-
+# NOTE: specific routes MUST come before parameterised routes (/api/targets/{id})
 @app.post("/api/targets/bulk-text")
 def bulk_text_import(payload: BulkTextCreate):
     db.init_db()
     lines = payload.text.replace(",", "\n").split("\n")
     targets_data = [{"website_url": u.strip()} for u in lines if u.strip()]
     res = db.add_targets_bulk(targets_data)
-    added = res["added"]
-    skipped = res["skipped"]
-    return {"added": added, "skipped": skipped, "message": f"{added} queued, {skipped} duplicate skipped."}
+    return {"added": res["added"], "skipped": res["skipped"],
+            "message": f"{res['added']} queued, {res['skipped']} duplicate skipped."}
 
 
 @app.post("/api/targets/upload")
@@ -332,44 +304,50 @@ async def upload_excel_or_csv(file: UploadFile = File(...)):
     db.init_db()
     filename = file.filename or "upload"
     contents = await file.read()
-
     try:
         parsed = parse_excel_or_csv(contents, filename)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to parse file: {exc}")
 
     targets = parsed["targets"]
     if not targets:
-        raise HTTPException(status_code=400, detail="No website URLs could be extracted from this spreadsheet.")
+        raise HTTPException(status_code=400, detail="No website URLs found in the file.")
 
-    cfg = db.get_business_config()
+    cfg      = db.get_business_config()
     suggested = parsed["suggested_profile"]
     if suggested:
         updates = {}
-        if not cfg.get("backlink_url") and suggested.get("backlink_url"):
-            updates["backlink_url"] = suggested["backlink_url"]
-        if not cfg.get("anchor_text") and suggested.get("anchor_text"):
-            updates["anchor_text"] = suggested["anchor_text"]
-        if not cfg.get("niche") and suggested.get("niche"):
-            updates["niche"] = suggested["niche"]
+        for key in ("backlink_url", "anchor_text", "niche"):
+            if not cfg.get(key) and suggested.get(key):
+                updates[key] = suggested[key]
         if updates:
             db.update_business_config(updates)
 
     res = db.add_targets_bulk(targets)
-    added = res["added"]
-    skipped = res["skipped"]
-
     return {
-        "success": True,
-        "filename": filename,
-        "added": added,
-        "skipped": skipped,
+        "success": True, "filename": filename,
+        "added": res["added"], "skipped": res["skipped"],
         "total_extracted": len(targets),
         "invalid_rows": parsed.get("invalid_rows", []),
         "duplicates_count": parsed.get("duplicates_count", 0),
         "suggested_profile": suggested,
-        "message": f"Successfully imported {added} targets from {filename} ({skipped} duplicate/existing skipped)."
+        "message": f"Successfully imported {res['added']} targets from {filename} ({res['skipped']} skipped).",
     }
+
+
+@app.post("/api/targets/bulk-delete")
+def bulk_delete(ids: List[int]):
+    count = db.delete_targets_bulk(ids)
+    return {"deleted": count}
+
+
+@app.post("/api/targets")
+def create_single_target(payload: TargetCreate):
+    db.init_db()
+    created = db.add_target(payload.dict())
+    if not created:
+        raise HTTPException(status_code=400, detail="Target already exists or URL is invalid.")
+    return created
 
 
 @app.get("/api/targets/{target_id}")
@@ -395,25 +373,20 @@ def get_target_content(target_id: int):
     if not item:
         raise HTTPException(status_code=404, detail="Target not found.")
     return {
-        "title": item.get("generated_article_title") or "",
-        "body": item.get("generated_article_body") or "",
+        "title":         item.get("generated_article_title") or "",
+        "body":          item.get("generated_article_body") or "",
         "pitch_subject": item.get("generated_pitch_subject") or "",
-        "pitch_body": item.get("generated_pitch_body") or "",
+        "pitch_body":    item.get("generated_pitch_body") or "",
     }
 
 
 @app.patch("/api/targets/{target_id}/content")
 def update_target_content(target_id: int, payload: ContentUpdate):
     updates = {}
-    if payload.title is not None:
-        updates["generated_article_title"] = payload.title
-    if payload.body is not None:
-        updates["generated_article_body"] = payload.body
-    if payload.pitch_subject is not None:
-        updates["generated_pitch_subject"] = payload.pitch_subject
-    if payload.pitch_body is not None:
-        updates["generated_pitch_body"] = payload.pitch_body
-
+    if payload.title         is not None: updates["generated_article_title"]   = payload.title
+    if payload.body          is not None: updates["generated_article_body"]    = payload.body
+    if payload.pitch_subject is not None: updates["generated_pitch_subject"]   = payload.pitch_subject
+    if payload.pitch_body    is not None: updates["generated_pitch_body"]      = payload.pitch_body
     item = db.update_target(target_id, updates)
     if not item:
         raise HTTPException(status_code=404, detail="Target not found.")
@@ -425,14 +398,9 @@ def approve_target_route(target_id: int, payload: ApprovalAction, background_tas
     item = db.approve_target(target_id, payload.notes or "")
     if not item:
         raise HTTPException(status_code=404, detail="Target not found.")
-
     if payload.execute_now:
-        # NOTE: on Vercel serverless, BackgroundTasks run synchronously within
-        # the same invocation and the process exits after response is sent.
-        # Automation requiring Playwright will not work on Vercel's free tier.
         background_tasks.add_task(automation_engine.execute_approved_target, target_id)
         return {"status": "approved_and_executing", "target": db.get_target_by_id(target_id)}
-
     return {"status": "approved", "target": item}
 
 
@@ -457,41 +425,30 @@ def regenerate_content(target_id: int):
     item = db.get_target_by_id(target_id)
     if not item:
         raise HTTPException(status_code=404, detail="Target not found.")
-    cfg = db.get_business_config()
+    cfg    = db.get_business_config()
     report = item.get("analysis_report_parsed") or {}
-
-    art = smart_content_generator.generate_article(item, cfg, report)
-    pitch = smart_content_generator.generate_pitch(item, cfg, report)
-
+    art    = smart_content_generator.generate_article(item, cfg, report)
+    pitch  = smart_content_generator.generate_pitch(item, cfg, report)
     updated = db.update_target(target_id, {
-        "generated_article_title": art["title"],
-        "generated_article_body": art["body"],
-        "generated_pitch_subject": pitch["subject"],
-        "generated_pitch_body": pitch["body"],
-        "status": "Draft Ready",
-        "stage": "ARTICLE_GEN"
+        "generated_article_title":  art["title"],
+        "generated_article_body":   art["body"],
+        "generated_pitch_subject":  pitch["subject"],
+        "generated_pitch_body":     pitch["body"],
+        "status": "Draft Ready", "stage": "ARTICLE_GEN",
     })
     return {"success": True, "target": updated}
 
 
 @app.delete("/api/targets/{target_id}")
 def delete_target_item(target_id: int):
-    deleted = db.delete_target(target_id)
-    if not deleted:
+    if not db.delete_target(target_id):
         raise HTTPException(status_code=404, detail="Target not found.")
     return {"success": True}
 
 
-@app.post("/api/targets/bulk-delete")
-def bulk_delete(ids: List[int]):
-    count = db.delete_targets_bulk(ids)
-    return {"deleted": count}
-
-
 @app.delete("/api/targets")
 def clear_all():
-    count = db.clear_all_targets()
-    return {"cleared": count}
+    return {"cleared": db.clear_all_targets()}
 
 
 @app.get("/api/stats")
@@ -500,7 +457,7 @@ def get_stats():
     return db.get_stats()
 
 
-# ─── Automation Controls ──────────────────────────────────────────────────────
+# ─── Automation ───────────────────────────────────────────────────────────────
 
 @app.post("/api/automation/run")
 def run_automation(payload: RunBatchRequest):
@@ -533,11 +490,9 @@ def verify_target(target_id: int):
         raise HTTPException(status_code=404, detail="Target not found.")
     if not t.get("live_post_url"):
         raise HTTPException(status_code=400, detail="Target does not have a live post URL yet.")
-
-    cfg = db.get_business_config()
+    cfg     = db.get_business_config()
     backlink = t.get("target_backlink_url") or cfg.get("backlink_url", "")
     anchor   = t.get("target_anchor_text")  or cfg.get("anchor_text", "")
-
     ok = automation_engine.verify_live_url(target_id, t["live_post_url"], backlink, anchor)
     return {"ok": ok, "target": db.get_target_by_id(target_id)}
 
@@ -545,13 +500,13 @@ def verify_target(target_id: int):
 @app.get("/api/automation/status")
 def get_automation_status():
     return {
-        "is_running": automation_engine.is_running,
+        "is_running":        automation_engine.is_running,
         "current_target_id": automation_engine.current_target_id,
-        "logs": automation_engine.logs[-60:],
+        "logs":              automation_engine.logs[-60:],
     }
 
 
-# ─── Email Outreach Routes ────────────────────────────────────────────────────
+# ─── Email ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/email/test")
 def test_email_connection(payload: Optional[EmailTestRequest] = None):
@@ -570,20 +525,16 @@ def dispatch_single_pitch(target_id: int):
     t = db.get_target_by_id(target_id)
     if not t:
         raise HTTPException(status_code=404, detail="Target not found.")
-
     report    = t.get("analysis_report_parsed") or {}
     recipient = report.get("contact_email") or "editorial@target-domain.com"
     subject   = t.get("generated_pitch_subject") or "Guest Article Pitch"
     body      = t.get("generated_pitch_body") or ""
-
     return email_outreach_client.send_pitch(recipient, subject, body, target_id)
 
 
-# ─── Live SSE Logs Stream ─────────────────────────────────────────────────────
-# Vercel serverless functions have a hard 30-second timeout.
-# We close the SSE stream at 20 s so the browser's EventSource can reconnect
-# cleanly without hitting the hard kill. On local development the stream is
-# kept open indefinitely (up to 1 h).
+# ─── SSE Logs Stream ──────────────────────────────────────────────────────────
+# Vercel serverless has a 30-second hard timeout on streaming responses.
+# We close the stream at 20 s so the browser EventSource can reconnect cleanly.
 
 @app.get("/api/logs/stream")
 async def stream_logs():
@@ -602,23 +553,31 @@ async def stream_logs():
         automation_engine.add_listener(listener)
         start = asyncio.get_event_loop().time()
         try:
-            yield f"data: {json.dumps({'message': 'Connected to LinkForge real-time execution stream', 'level': 'info', 'timestamp': ''})}\n\n"
+            yield f"data: {json.dumps({'message': 'Connected to LinkForge stream', 'level': 'info', 'timestamp': ''})}\n\n"
             while True:
-                elapsed = asyncio.get_event_loop().time() - start
-                if elapsed >= MAX_SSE_SECONDS:
+                if asyncio.get_event_loop().time() - start >= MAX_SSE_SECONDS:
                     yield ": timeout\n\n"
                     break
                 try:
                     entry = await asyncio.wait_for(queue.get(), timeout=1.0)
                     yield f"data: {json.dumps(entry)}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": ping\n\n"   # keepalive so Vercel doesn't kill early
+                    yield ": ping\n\n"
         except asyncio.CancelledError:
             pass
         finally:
             automation_engine.remove_listener(listener)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ─── SPA catch-all: serve dashboard for any unmatched GET ────────────────────
+# This handles cases where Vercel forwards paths like /some-page to FastAPI
+# and no specific route matches — we return the dashboard so the JS SPA handles it.
+
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+def spa_fallback(full_path: str):
+    return _dashboard_response()
 
 
 if __name__ == "__main__":
