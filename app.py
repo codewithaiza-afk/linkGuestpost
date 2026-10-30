@@ -140,15 +140,39 @@ class RunBatchRequest(BaseModel):
 
 @app.middleware("http")
 async def vercel_path_rewrite_middleware(request, call_next):
-    # Normalize paths when Vercel serverless rewrites requests to /api/index or /api/index.py
+    """
+    Vercel rewrites ALL requests to /api/index.py with the original path
+    stored in the query string as '__path'. We extract that and restore the
+    real path so that FastAPI sees the correct route.
+
+    Vercel passes the original URL path via the 'x-vercel-id' header is not
+    useful, but the raw ASGI scope 'path' already contains what Vercel forwarded.
+
+    When vercel.json has  { "source": "/(.*)", "destination": "/api/index.py" }
+    Vercel sets scope['path'] = '/api/index.py' and puts the real path in
+    scope['raw_path'] as well as the query string param '_path' (undocumented).
+    The safest approach: read the original path from the 'x-original-url'
+    header (set by Vercel) or fall back to stripping the /api/index.py prefix.
+    """
     path = request.scope.get("path", "")
-    for prefix in ("/api/index.py", "/api/index"):
-        if path == prefix:
-            request.scope["path"] = "/"
-            break
-        elif path.startswith(prefix + "/"):
-            request.scope["path"] = path[len(prefix):]
-            break
+
+    # Method 1: Vercel sets x-original-url header with the real path
+    original_url = request.headers.get("x-original-url") or request.headers.get("x-forwarded-url")
+    if original_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(original_url)
+        real_path = parsed.path or "/"
+        request.scope["path"] = real_path
+    else:
+        # Method 2: Strip the /api/index.py or /api/index prefix that Vercel prepends
+        for prefix in ("/api/index.py", "/api/index"):
+            if path == prefix:
+                request.scope["path"] = "/"
+                break
+            elif path.startswith(prefix + "/"):
+                request.scope["path"] = path[len(prefix):]
+                break
+
     response = await call_next(request)
     return response
 
