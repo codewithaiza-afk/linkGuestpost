@@ -577,6 +577,8 @@ async def stream_logs():
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 def spa_fallback(full_path: str):
+    if full_path.startswith("api/") or full_path == "api":
+        raise HTTPException(status_code=404, detail=f"API route not found: /{full_path}")
     return _dashboard_response()
 
 
